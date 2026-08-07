@@ -1,0 +1,1333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Penguin Defense — Save the Colony</title>
+<style>
+  :root {
+    --deep: #14212e;
+    --panel: #1e2f3f;
+    --ice-text: #dcebf4;
+    --gold: #fac850;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%;
+    background: var(--deep);
+    font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+    color: var(--ice-text);
+    overflow: hidden;
+    touch-action: none;
+  }
+  #wrap {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 10px;
+  }
+  header {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+  }
+  header h1 {
+    font-size: 20px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: #fff;
+  }
+  header span { font-size: 13px; opacity: 0.65; }
+  canvas {
+    background: #deecf4;
+    border-radius: 10px;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+    max-width: 100%;
+    max-height: calc(100% - 40px);
+    cursor: crosshair;
+    display: block;
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <header><h1>🐧 Penguin Defense</h1><span>keep the oil off the ice</span></header>
+  <canvas id="game" width="1080" height="720"></canvas>
+</div>
+<script>
+"use strict";
+// ============================================================================
+// Config
+// ============================================================================
+const W = 1080, H = 720, PANEL_W = 220, FIELD_W = W - PANEL_W, FPS = 60;
+const STARTING_FISH = 220, STARTING_LIVES = 20, TOTAL_WAVES = 20;
+const BOMB_COST = 1000;
+const REPAIR_COST = 10;
+const OIL_HITS_TO_DISABLE = 4;
+
+const ICE = "#deecf4", ICE_SHADE = "#cce0ec", WATER = "#3a78aa",
+      WATER_DARK = "#285f8c", PATH_COLOR = "#b0c8d8", PATH_EDGE = "#96b2c6",
+      PANEL_BG = "#1e2c3a", PANEL_LIGHT = "#2e4052", WHITE = "#f5f8fa",
+      BLACK = "#14181c", OIL = "#1c181e", OIL_SHINE = "#5a466e",
+      GOLD = "#fac850", RED = "#dc5046", GREEN = "#5ac878", BLUE_LT = "#8cc8f0";
+
+// Path is randomized each game: a self-avoiding winding walk on a coarse grid,
+// entering from the left edge and exiting through the bottom-right corner.
+let PATH = [];
+
+const GRID = {
+  COLS: 10, ROWS: 7,
+  cx: c => Math.round(64 + c * (800 - 64) / 9),
+  cy: r => Math.round(104 + r * (616 - 104) / 6),
+};
+
+function shuffle(a) {
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+function generatePath() {
+  const { COLS, ROWS, cx, cy } = GRID;
+  const goal = [COLS - 1, ROWS - 1];               // bottom-right corner
+  for (let attempt = 0; attempt < 80; attempt++) {
+    const minLen = Math.max(16, 30 - attempt);     // prefer windy, relax if unlucky
+    const startR = Math.floor(Math.random() * ROWS);
+    const visited = new Set();
+    const cells = [];
+    let nodes = 0, found = false;
+
+    (function dfs(c, r) {
+      if (found || ++nodes > 30000) return;
+      visited.add(c + "," + r);
+      cells.push([c, r]);
+      if (c === goal[0] && r === goal[1] && cells.length >= minLen) { found = true; return; }
+      for (const [dc, dr] of shuffle([[1, 0], [-1, 0], [0, 1], [0, -1]])) {
+        const nc = c + dc, nr = r + dr;
+        if (nc < 0 || nc >= COLS || nr < 0 || nr >= ROWS) continue;
+        if (visited.has(nc + "," + nr)) continue;
+        dfs(nc, nr);
+        if (found) return;
+      }
+      cells.pop();
+      visited.delete(c + "," + r);
+    })(0, startR);
+
+    if (found) {
+      // convert cells to pixel waypoints, dropping collinear midpoints
+      const px = cells.map(([c, r]) => [cx(c), cy(r)]);
+      const pts = [[-40, px[0][1]]];               // enter from off-screen left
+      for (let i = 0; i < px.length; i++) {
+        if (i > 0 && i < px.length - 1) {
+          const [a, b, c2] = [px[i - 1], px[i], px[i + 1]];
+          if ((a[0] === b[0] && b[0] === c2[0]) || (a[1] === b[1] && b[1] === c2[1])) continue;
+        }
+        pts.push(px[i]);
+      }
+      pts.push([px[px.length - 1][0], H + 40]);    // exit off-screen bottom
+      return pts;
+    }
+  }
+  // safety fallback: a simple zigzag (practically unreachable)
+  return [[-40, 140], [200, 140], [200, 500], [500, 500], [500, 200], [800, 200], [800, H + 40]];
+}
+
+const TOWER_TYPES = {
+  snowball: {
+    name: "Snowballer", desc: "Reliable snowball lobber", cost: 80,
+    color: "#3c4655", belly: "#f0f5fa", beak: "#f5aa3c",
+    levels: [[12, 130, 42], [18, 145, 36], [28, 160, 28]],
+    upgradeCost: [70, 120], projectile: "snowball",
+  },
+  ice: {
+    name: "Frost Penguin", desc: "Chills oil, slowing it", cost: 100,
+    color: "#46648c", belly: "#d7ebfa", beak: "#78bef0",
+    levels: [[6, 120, 50], [9, 135, 44], [14, 150, 36]],
+    upgradeCost: [80, 140], projectile: "iceshard",
+    slow: [[0.55, 90], [0.45, 120], [0.35, 150]],
+  },
+  sonar: {
+    name: "Sonar Penguin", desc: "Damaging pulse hits ALL oil in range", cost: 150,
+    color: "#553c5f", belly: "#ebe1f5", beak: "#c878dc",
+    levels: [[8, 110, 66], [12, 125, 58], [18, 140, 48]],
+    upgradeCost: [110, 180], projectile: "pulse",
+  },
+  fisher: {
+    name: "Fisher Penguin", desc: "Catches fish (income) each tick", cost: 120,
+    color: "#3c5546", belly: "#e6f5eb", beak: "#fac850",
+    levels: [[4, 0, 180], [7, 0, 170], [11, 0, 160]],
+    upgradeCost: [90, 150], projectile: null,
+  },
+  rainbow: {
+    name: "Rainbow Penguin", desc: "Vomits a mighty rainbow beam at one oil", cost: 200,
+    color: "#5a5a78", belly: "#ffffff", beak: "#fac850",
+    levels: [[20, 150, 20], [30, 165, 16], [45, 180, 12]],
+    upgradeCost: [140, 220], projectile: "beam",
+  },
+};
+const TOWER_ORDER = ["snowball", "ice", "sonar", "fisher", "rainbow"];
+const MAX_RAINBOWS = 2;   // rainbow penguins are rare and precious
+const RAINBOW = ["#e84040", "#f5a030", "#f5e050", "#50c860", "#4090e8", "#8050c8"];
+
+const ENEMY_TYPES = {
+  droplet: { hp: 26, speed: 1.55, radius: 11, reward: 8, damage: 1 },
+  slick:   { hp: 70, speed: 1.05, radius: 15, reward: 14, damage: 2 },
+  tar:     { hp: 190, speed: 0.62, radius: 20, reward: 26, damage: 3 },
+  spitter: { hp: 120, speed: 0.5, radius: 17, reward: 22, damage: 2 },
+  crude:   { hp: 460, speed: 0.5, radius: 26, reward: 60, damage: 5 },
+  slugboss:   { hp: 2600, speed: 0.35, radius: 34, reward: 250, damage: 10 },
+  turtleboss: { hp: 4200, speed: 0.34, radius: 40, reward: 500, damage: 20 },
+};
+const BOSS_NAMES = { slugboss: "THE OIL SLUG", turtleboss: "THE OIL TURTLE" };
+
+function waveComposition(n) {
+  // boss waves
+  if (n === 10.5) {
+    const out = [["slugboss", 40]];
+    for (let i = 0; i < 6; i++) out.push(["droplet", 70 + Math.floor(Math.random() * 30)]);
+    return out;
+  }
+  if (n === 20.5) {
+    const out = [["turtleboss", 40]];
+    for (let i = 0; i < 4; i++) out.push(["slick", 80 + Math.floor(Math.random() * 30)]);
+    for (let i = 0; i < 2; i++) out.push(["tar", 90 + Math.floor(Math.random() * 40)]);
+    return out;
+  }
+  const out = [];
+  const push = (kind, count, lo, hi) => {
+    for (let i = 0; i < count; i++) out.push([kind, lo + Math.floor(Math.random() * (hi - lo))]);
+  };
+  push("droplet", 6 + n * 2, 26, 44);
+  push("slick", Math.max(0, n - 2) * 2, 38, 60);
+  push("tar", Math.max(0, n - 5), 55, 80);
+  push("spitter", Math.max(0, Math.floor((n - 4) / 2)), 50, 75);
+  push("crude", Math.max(0, Math.floor((n - 9) / 3)), 90, 120);
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+}
+const hpScale = n => 1.0 + (n - 1) * 0.085;
+
+// ============================================================================
+// Path helpers
+// ============================================================================
+const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+
+let DENSE_PATH = [];
+
+function computeDensePath() {
+  const pts = [];
+  for (let i = 0; i < PATH.length - 1; i++) {
+    const [a, b] = [PATH[i], PATH[i + 1]];
+    const steps = Math.max(1, Math.floor(dist(a, b)));
+    for (let s = 0; s < steps; s++) {
+      const t = s / steps;
+      pts.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+    }
+  }
+  pts.push(PATH[PATH.length - 1]);
+  DENSE_PATH = pts;
+}
+
+function pointNearPath(pos, threshold = 34) {
+  for (let i = 0; i < DENSE_PATH.length; i += 8)
+    if (dist(pos, DENSE_PATH[i]) < threshold) return true;
+  return false;
+}
+
+// ============================================================================
+// Entities
+// ============================================================================
+class Enemy {
+  constructor(kind, wave) {
+    const d = ENEMY_TYPES[kind];
+    this.kind = kind;
+    this.wave = wave;
+    this.maxHp = d.hp * hpScale(wave);
+    this.hp = this.maxHp;
+    this.baseSpeed = d.speed;
+    this.radius = d.radius;
+    this.reward = d.reward;
+    this.damage = d.damage;
+    this.pathI = 0;
+    this.slowMult = 1;
+    this.slowTimer = 0;
+    this.wobble = Math.random() * Math.PI * 2;
+    this.dead = false;
+    this.reachedEnd = false;
+    this.shedTimer = 240;   // slug: frames until it sheds a droplet
+    this.cycle = 0;         // turtle: shell-up cycle
+    this.spitCd = 90 + Math.floor(Math.random() * 80);   // spitter: frames until next glob
+  }
+  get pos() { return DENSE_PATH[Math.min(Math.floor(this.pathI), DENSE_PATH.length - 1)]; }
+  get dir() {
+    const i = Math.min(Math.floor(this.pathI), DENSE_PATH.length - 1);
+    const j = Math.max(0, i - 12);
+    const [x1, y1] = DENSE_PATH[j], [x2, y2] = DENSE_PATH[i];
+    const d = Math.hypot(x2 - x1, y2 - y1) || 1;
+    return [(x2 - x1) / d, (y2 - y1) / d];
+  }
+  get shelled() { return this.kind === "turtleboss" && this.cycle >= 240; }
+  applySlow(mult, frames) {
+    if (mult < this.slowMult || this.slowTimer <= 0) this.slowMult = mult;
+    this.slowTimer = Math.max(this.slowTimer, frames);
+  }
+  update(g) {
+    if (this.slowTimer > 0 && --this.slowTimer === 0) this.slowMult = 1;
+    let move = this.baseSpeed * this.slowMult;
+    if (this.kind === "turtleboss") {
+      this.cycle = (this.cycle + 1) % 360;   // 4s crawling, 2s hiding armored in shell
+      if (this.shelled) move = 0;
+    }
+    if (this.kind === "slugboss" && g && --this.shedTimer <= 0) {
+      this.shedTimer = 240;                  // sheds a living droplet from its trail every 4s
+      const d = new Enemy("droplet", this.wave);
+      d.pathI = Math.max(0, this.pathI - 26);
+      g.enemies.push(d);
+    }
+    if (this.kind === "spitter" && g && --this.spitCd <= 0) {
+      const inRange = g.towers.filter(t => !t.disabled && dist(this.pos, t.pos) <= 170);
+      if (inRange.length) {
+        const victim = inRange.reduce((a, b) => (dist(this.pos, a.pos) < dist(this.pos, b.pos) ? a : b));
+        g.projectiles.push(new OilGlob(this.pos, victim, g));
+        this.spitCd = 170;
+      } else {
+        this.spitCd = 30;                    // nothing to spit at yet — check again soon
+      }
+    }
+    this.pathI += move;
+    if (this.pathI >= DENSE_PATH.length - 1) this.reachedEnd = true;
+    this.wobble += 0.15;
+  }
+  hit(dmg) {
+    if (this.shelled) dmg *= 0.25;           // turtle shell soaks 75%
+    this.hp -= dmg;
+    if (this.hp <= 0) this.dead = true;
+  }
+  draw(c) {
+    if (this.kind === "slugboss") this.drawSlug(c);
+    else if (this.kind === "turtleboss") this.drawTurtle(c);
+    else if (this.kind === "spitter") this.drawSpitter(c);
+    else this.drawBlob(c);
+    const [x, y] = this.pos, r = this.radius;
+    if (this.slowTimer > 0) {
+      c.fillStyle = "rgba(140,210,255,0.28)";
+      circle(c, x, y, r + 3);
+    }
+    if (this.hp < this.maxHp && !BOSS_NAMES[this.kind]) {  // bosses use the big top bar
+      const w = r * 2, frac = Math.max(0, this.hp / this.maxHp);
+      c.fillStyle = "#3c3c3c"; c.fillRect(x - r, y - r - 9, w, 5);
+      c.fillStyle = frac > 0.4 ? GREEN : RED; c.fillRect(x - r, y - r - 9, w * frac, 5);
+    }
+  }
+  drawBlob(c) {
+    const [x, y] = this.pos, r = this.radius, wob = Math.sin(this.wobble) * 2;
+    c.fillStyle = OIL;
+    circle(c, x, y + wob * 0.3, r);
+    circle(c, x - r * 0.5, y + r * 0.35, r * 0.6);
+    circle(c, x + r * 0.5, y + r * 0.3 - wob * 0.4, r * 0.55);
+    c.fillStyle = OIL_SHINE;
+    circle(c, x - r * 0.3, y - r * 0.35, Math.max(2, r * 0.28));
+    const ex = r * 0.32;
+    c.fillStyle = "#fff0c8";
+    circle(c, x - ex, y - 2, 3); circle(c, x + ex, y - 2, 3);
+    c.fillStyle = BLACK;
+    circle(c, x - ex, y - 2, 1.2); circle(c, x + ex, y - 2, 1.2);
+  }
+  drawSpitter(c) {
+    const [x, y] = this.pos, r = this.radius, wob = Math.sin(this.wobble) * 2;
+    c.fillStyle = OIL;
+    circle(c, x, y + wob * 0.3, r);
+    circle(c, x - r * 0.55, y + r * 0.4, r * 0.55);
+    circle(c, x + r * 0.55, y + r * 0.4, r * 0.55);
+    c.fillStyle = "#3a5a48";                        // sickly green sheen
+    circle(c, x - r * 0.3, y - r * 0.35, Math.max(2, r * 0.28));
+    // mouth gapes wide as it winds up a spit
+    const gape = this.spitCd < 25 ? 1 : 0.35;
+    c.fillStyle = "#0a080c";
+    ellipse(c, x, y + r * 0.25, r * 0.42, r * 0.42 * gape);
+    if (gape === 1) {
+      c.fillStyle = "#4a6a52";
+      circle(c, x, y + r * 0.2, r * 0.16);          // glob forming in its mouth
+    }
+    // angry eyes with brows
+    const ex = r * 0.38;
+    c.fillStyle = "#fff0c8";
+    circle(c, x - ex, y - r * 0.3, 3); circle(c, x + ex, y - r * 0.3, 3);
+    c.fillStyle = BLACK;
+    circle(c, x - ex, y - r * 0.3, 1.3); circle(c, x + ex, y - r * 0.3, 1.3);
+    c.strokeStyle = BLACK; c.lineWidth = 2;
+    c.beginPath(); c.moveTo(x - ex - 4, y - r * 0.55); c.lineTo(x - ex + 3, y - r * 0.42); c.stroke();
+    c.beginPath(); c.moveTo(x + ex + 4, y - r * 0.55); c.lineTo(x + ex - 3, y - r * 0.42); c.stroke();
+  }
+  drawSlug(c) {
+    const [x, y] = this.pos, [dx, dy] = this.dir, r = this.radius;
+    // slime trail
+    c.fillStyle = "rgba(40,32,44,0.3)";
+    for (let i = 1; i <= 5; i++) circle(c, x - dx * r * 0.8 * i, y - dy * r * 0.8 * i, r * 0.45 * (1 - i * 0.13));
+    // segmented body, tapering toward the tail
+    for (let i = 3; i >= 0; i--) {
+      c.fillStyle = i === 0 ? OIL : "#241e28";
+      circle(c, x - dx * r * 0.65 * i, y - dy * r * 0.65 * i + Math.sin(this.wobble + i) * 2.5, r * (1 - i * 0.16));
+    }
+    c.fillStyle = OIL_SHINE;
+    circle(c, x - r * 0.25, y - r * 0.4, r * 0.24);
+    // eyestalks
+    for (const s of [-1, 1]) {
+      const bx = x + dx * r * 0.4 + s * 7;
+      const topY = y - r - 13 + Math.sin(this.wobble + s) * 2;
+      c.strokeStyle = OIL; c.lineWidth = 4;
+      c.beginPath(); c.moveTo(bx, y - r * 0.3); c.lineTo(bx + s * 4, topY); c.stroke();
+      c.fillStyle = "#fff0c8"; circle(c, bx + s * 4, topY, 4.5);
+      c.fillStyle = BLACK; circle(c, bx + s * 4, topY, 2);
+    }
+  }
+  drawTurtle(c) {
+    const [x, y] = this.pos, [dx, dy] = this.dir, r = this.radius;
+    const shelled = this.shelled;
+    if (!shelled) {
+      // flippers paddle while crawling
+      const p = Math.sin(this.wobble) * 4;
+      c.fillStyle = OIL;
+      ellipse(c, x - dy * (r * 0.85) + dx * p, y + dx * (r * 0.85) + dy * p, 12, 7);
+      ellipse(c, x + dy * (r * 0.85) - dx * p, y - dx * (r * 0.85) - dy * p, 12, 7);
+      ellipse(c, x - dy * (r * 0.7) - dx * (r * 0.7), y + dx * (r * 0.7) - dy * (r * 0.7), 10, 6);
+      ellipse(c, x + dy * (r * 0.7) - dx * (r * 0.7), y - dx * (r * 0.7) - dy * (r * 0.7), 10, 6);
+      // head
+      const hx = x + dx * (r + 9), hy = y + dy * (r + 9);
+      c.fillStyle = OIL; circle(c, hx, hy, 11);
+      c.fillStyle = "#fff0c8";
+      circle(c, hx - dy * 4, hy + dx * 4, 2.6); circle(c, hx + dy * 4, hy - dx * 4, 2.6);
+      c.fillStyle = BLACK;
+      circle(c, hx - dy * 4, hy + dx * 4, 1.2); circle(c, hx + dy * 4, hy - dx * 4, 1.2);
+    }
+    // shell
+    c.fillStyle = "#241e28"; circle(c, x, y, r);
+    c.fillStyle = shelled ? "#3d3348" : "#332a3a"; circle(c, x, y, r * 0.78);
+    c.fillStyle = "#4a3c56";
+    circle(c, x, y, r * 0.22);
+    for (let i = 0; i < 6; i++) {
+      const a = i * Math.PI / 3 + 0.3;
+      circle(c, x + Math.cos(a) * r * 0.48, y + Math.sin(a) * r * 0.48, r * 0.16);
+    }
+    c.fillStyle = OIL_SHINE;
+    circle(c, x - r * 0.35, y - r * 0.42, r * 0.17);
+    if (shelled) {
+      // armored glint
+      c.strokeStyle = `rgba(200,220,255,${0.4 + 0.3 * Math.sin(this.wobble * 2)})`;
+      c.lineWidth = 2;
+      c.beginPath(); c.arc(x, y, r + 3, 0, 7); c.stroke();
+    }
+  }
+}
+
+class Projectile {
+  constructor(pos, target, dmg, kind, slow) {
+    [this.x, this.y] = pos;
+    this.target = target; this.dmg = dmg; this.kind = kind;
+    this.slow = slow; this.speed = 7.5; this.dead = false;
+  }
+  update() {
+    const t = this.target;
+    if (t.dead || t.reachedEnd) { this.dead = true; return; }
+    const [tx, ty] = t.pos, d = Math.hypot(tx - this.x, ty - this.y);
+    if (d < this.speed + t.radius) {
+      t.hit(this.dmg);
+      if (this.slow) t.applySlow(...this.slow);
+      this.dead = true; return;
+    }
+    this.x += (tx - this.x) / d * this.speed;
+    this.y += (ty - this.y) / d * this.speed;
+  }
+  draw(c) {
+    if (this.kind === "snowball") {
+      c.fillStyle = WHITE; circle(c, this.x, this.y, 6);
+      c.strokeStyle = "#c8d7e1"; c.lineWidth = 1;
+      c.beginPath(); c.arc(this.x, this.y, 6, 0, 7); c.stroke();
+    } else {
+      c.fillStyle = BLUE_LT; circle(c, this.x, this.y, 5);
+      c.fillStyle = WHITE; circle(c, this.x - 1, this.y - 1, 2);
+    }
+  }
+}
+
+class OilGlob {
+  constructor(pos, tower, g) {
+    [this.x, this.y] = pos;
+    this.tower = tower;
+    this.g = g;
+    this.speed = 4;
+    this.dead = false;
+    this.spin = Math.random() * 7;
+  }
+  update() {
+    const [tx, ty] = this.tower.pos;
+    const d = Math.hypot(tx - this.x, ty - this.y);
+    if (d < this.speed + 12) {
+      if (this.g.towers.includes(this.tower)) this.tower.takeOilHit(this.g);
+      this.dead = true;
+      return;
+    }
+    this.x += (tx - this.x) / d * this.speed;
+    this.y += (ty - this.y) / d * this.speed;
+    this.spin += 0.25;
+  }
+  draw(c) {
+    c.fillStyle = OIL;
+    circle(c, this.x, this.y, 6);
+    circle(c, this.x + Math.cos(this.spin) * 5, this.y + Math.sin(this.spin) * 5, 3);
+    c.fillStyle = "#3a5a48";
+    circle(c, this.x - 2, this.y - 2, 1.8);
+  }
+}
+
+class PulseFX {
+  constructor(pos, maxR) { this.pos = pos; this.r = 12; this.maxR = maxR; this.dead = false; }
+  update() { this.r += 6; if (this.r >= this.maxR) this.dead = true; }
+  draw(c) {
+    const alpha = Math.max(0, 0.63 * (1 - this.r / this.maxR));
+    c.strokeStyle = `rgba(200,140,230,${alpha})`; c.lineWidth = 3;
+    c.beginPath(); c.arc(this.pos[0], this.pos[1], this.r, 0, 7); c.stroke();
+  }
+}
+
+class BeamFX {
+  constructor(from, target) {
+    this.from = from; this.target = target;
+    this.to = [...target.pos];
+    this.life = 9; this.dead = false;
+  }
+  update() {
+    if (!this.target.dead && !this.target.reachedEnd) this.to = [...this.target.pos];
+    if (--this.life <= 0) this.dead = true;
+  }
+  draw(c) {
+    const [x1, y1] = this.from, [x2, y2] = this.to;
+    const d = Math.hypot(x2 - x1, y2 - y1) || 1;
+    const px = -(y2 - y1) / d, py = (x2 - x1) / d;   // perpendicular unit
+    c.globalAlpha = Math.min(1, this.life / 6);
+    c.lineCap = "round";
+    RAINBOW.forEach((col, i) => {
+      const off = (i - (RAINBOW.length - 1) / 2) * 2.4;
+      c.strokeStyle = col; c.lineWidth = 3;
+      c.beginPath();
+      c.moveTo(x1 + px * off, y1 + py * off);
+      c.lineTo(x2 + px * off * 0.4, y2 + py * off * 0.4);
+      c.stroke();
+    });
+    // sparkle at impact
+    c.fillStyle = "#ffffff";
+    circle(c, x2, y2, 4 + Math.random() * 3);
+    c.globalAlpha = 1;
+  }
+}
+
+class GlitterShower {
+  constructor() {
+    this.life = 150;
+    this.dead = false;
+    this.parts = [];
+    for (let i = 0; i < 280; i++) {
+      this.parts.push({
+        x: Math.random() * W,
+        y: Math.random() * H - H * 0.35,
+        vx: (Math.random() - 0.5) * 1.4,
+        vy: 1 + Math.random() * 2.6,
+        r: 1.5 + Math.random() * 2.5,
+        col: RAINBOW[i % RAINBOW.length],
+        tw: Math.random() * Math.PI * 2,   // twinkle phase
+      });
+    }
+  }
+  update() {
+    if (--this.life <= 0) this.dead = true;
+    for (const p of this.parts) {
+      p.x += p.vx;
+      p.y += p.vy;
+      p.tw += 0.32;
+    }
+  }
+  draw(c) {
+    // brief white flash at detonation
+    if (this.life > 138) {
+      c.fillStyle = `rgba(255,255,255,${((this.life - 138) / 12) * 0.55})`;
+      c.fillRect(0, 0, W, H);
+    }
+    for (const p of this.parts) {
+      c.globalAlpha = Math.min(1, this.life / 55) * (0.45 + 0.55 * Math.abs(Math.sin(p.tw)));
+      c.fillStyle = p.col;
+      circle(c, p.x, p.y, p.r);
+    }
+    c.globalAlpha = 1;
+  }
+}
+
+class Orca {
+  constructor(target, g) {
+    this.target = target;
+    this.g = g;
+    const ty = target.pos[1];
+    this.fromTop = ty < H / 2;                 // strike from the nearest water edge
+    this.startY = this.fromTop ? 13 : H - 13;
+    this.x = target.pos[0];
+    this.y = this.startY;
+    this.grabY = ty;
+    this.phase = "warn";
+    this.t = 0;
+    this.stolen = null;
+    this.dead = false;
+  }
+  update() {
+    this.t++;
+    if (this.phase === "warn") {
+      if (this.t > 55) { this.phase = "approach"; this.t = 0; }
+    } else if (this.phase === "approach") {
+      const k = Math.min(1, this.t / 55);
+      const e = k * k * (3 - 2 * k);           // smoothstep lunge
+      this.y = this.startY + (this.grabY - this.startY) * e;
+      if (k >= 1) {
+        const idx = this.g.towers.indexOf(this.target);
+        if (idx >= 0) {
+          this.stolen = this.target;
+          this.g.towers.splice(idx, 1);
+          if (this.g.selectedTower === this.target) this.g.selectedTower = null;
+          this.g.floaters.push(new FloatText([this.x, this.y - 34],
+            `🐋 The orca stole your ${this.target.data.name}!`, RED));
+        } else {
+          this.g.floaters.push(new FloatText([this.x, this.y - 34], "The orca left hungry!", BLUE_LT));
+        }
+        this.phase = "hold"; this.t = 0;
+      }
+    } else if (this.phase === "hold") {
+      if (this.t > 16) { this.phase = "retreat"; this.t = 0; }
+    } else if (this.phase === "retreat") {
+      const k = Math.min(1, this.t / 55);
+      const e = k * k * (3 - 2 * k);
+      this.y = this.grabY + (this.startY - this.grabY) * e;
+      if (k >= 1) this.dead = true;
+    }
+  }
+  draw(c) {
+    if (this.phase === "warn") {
+      // rippling water where it's about to burst out
+      for (let i = 0; i < 3; i++) {
+        const rr = ((this.t * 1.4 + i * 14) % 42) + 4;
+        c.strokeStyle = `rgba(200,230,250,${0.7 - rr / 60})`;
+        c.lineWidth = 2.5;
+        c.beginPath(); c.arc(this.x, this.startY, rr, 0, 7); c.stroke();
+      }
+      return;
+    }
+    const movingDown = (this.phase === "approach") === this.fromTop;
+    const angle = (movingDown ? Math.PI / 2 : -Math.PI / 2) + Math.sin(this.t * 0.25) * 0.07;
+    c.save();
+    c.translate(this.x, this.y);
+    c.rotate(angle);
+    // body
+    c.fillStyle = "#10141a";
+    ellipse(c, 0, 0, 36, 15);
+    // tail flukes
+    c.beginPath(); c.moveTo(-30, 0); c.lineTo(-48, -11); c.lineTo(-40, 0); c.lineTo(-48, 11);
+    c.closePath(); c.fill();
+    // dorsal fin
+    c.beginPath(); c.moveTo(-6, -12); c.lineTo(3, -32); c.lineTo(10, -12); c.closePath(); c.fill();
+    // white belly + eye patch
+    c.fillStyle = "#f0f4f8";
+    ellipse(c, 4, 8, 22, 5.5);
+    ellipse(c, 19, -7, 6.5, 3.5);
+    c.fillStyle = BLACK; circle(c, 19, -7, 1.6);
+    // the stolen penguin, clamped in its jaws
+    if (this.stolen && (this.phase === "hold" || this.phase === "retreat")) {
+      const sd = this.stolen.data;
+      c.fillStyle = this.stolen.kind === "rainbow" ? RAINBOW[Math.floor(this.t / 5) % 6] : sd.color;
+      ellipse(c, 42, 0, 8, 11);
+      c.fillStyle = sd.belly; ellipse(c, 42, 2, 5, 7);
+      c.fillStyle = sd.beak;
+      c.beginPath(); c.moveTo(40, -9); c.lineTo(44, -9); c.lineTo(42, -5); c.closePath(); c.fill();
+    }
+    c.restore();
+  }
+}
+
+class FloatText {
+  constructor(pos, text, color) { [this.x, this.y] = pos; this.text = text; this.color = color; this.life = 50; }
+  update() { this.y -= 0.7; this.life--; }
+  draw(c) {
+    c.globalAlpha = Math.max(0, this.life / 50);
+    c.fillStyle = this.color; c.font = "bold 15px Trebuchet MS"; c.textAlign = "center";
+    c.fillText(this.text, this.x, this.y);
+    c.globalAlpha = 1; c.textAlign = "left";
+  }
+}
+
+class Tower {
+  constructor(kind, pos) {
+    this.kind = kind; this.pos = pos; this.level = 0; this.cooldown = 0;
+    this.data = TOWER_TYPES[kind]; this.spent = this.data.cost;
+    this.anim = Math.random() * Math.PI * 2;
+    this.hits = 0;                     // oil-glob hits taken
+  }
+  get disabled() { return this.hits >= OIL_HITS_TO_DISABLE; }
+  takeOilHit(g) {
+    if (this.disabled) return;
+    this.hits++;
+    if (this.disabled) {
+      g.floaters.push(new FloatText(this.pos, `${this.data.name} disabled! Repair: ${REPAIR_COST} fish`, RED));
+    } else {
+      g.floaters.push(new FloatText(this.pos, `Splat! (${this.hits}/${OIL_HITS_TO_DISABLE})`, RED));
+    }
+  }
+  get stats() { return this.data.levels[this.level]; }
+  canUpgrade() { return this.level < 2; }
+  upgradeCost() { return this.canUpgrade() ? this.data.upgradeCost[this.level] : null; }
+  sellValue() { return Math.floor(this.spent * 0.6); }
+  update(g) {
+    this.anim += 0.06;
+    if (this.disabled) return;         // oiled up — needs repair
+    if (this.cooldown > 0) this.cooldown--;
+    // dazzled by the glitter bomb: attackers stop firing (fishers keep fishing)
+    if (g.stunTimer > 0 && this.data.projectile) return;
+    if (this.cooldown > 0) return;
+    const [dmg, rng, cd] = this.stats;
+    if (this.kind === "fisher") {
+      this.cooldown = cd; g.fish += dmg;
+      g.floaters.push(new FloatText(this.pos, `+${dmg}`, GOLD));
+      return;
+    }
+    const inRange = g.enemies.filter(e => !e.dead && !e.reachedEnd && dist(this.pos, e.pos) <= rng);
+    if (!inRange.length) return;
+    if (this.kind === "sonar") {
+      inRange.forEach(e => e.hit(dmg));
+      g.fx.push(new PulseFX(this.pos, rng));
+      this.cooldown = cd;
+    } else if (this.kind === "rainbow") {
+      // vomit a rainbow beam at the single oil furthest along the path
+      const target = inRange.reduce((a, b) => (a.pathI > b.pathI ? a : b));
+      target.hit(dmg);
+      const beakPos = [this.pos[0], this.pos[1] - (15 + this.level * 1.5) + 8];
+      g.fx.push(new BeamFX(beakPos, target));
+      this.cooldown = cd;
+    } else {
+      const target = inRange.reduce((a, b) => (a.pathI > b.pathI ? a : b));
+      const slow = this.kind === "ice" ? this.data.slow[this.level] : null;
+      g.projectiles.push(new Projectile(this.pos, target, dmg, this.data.projectile, slow));
+      this.cooldown = cd;
+    }
+  }
+  draw(c, selected) {
+    const [x, y] = this.pos, d = this.data;
+    const bob = Math.sin(this.anim) * 1.5;
+    const bh = 30 + this.level * 3, bw = 22 + this.level * 2;
+    const isRainbow = this.kind === "rainbow";
+    // rainbow penguins shimmer through the whole spectrum
+    const bodyCol = isRainbow ? `hsl(${(this.anim * 60) % 360}, 55%, 42%)` : d.color;
+    if (selected) {
+      const rng = this.stats[1];
+      if (rng > 0) {
+        c.fillStyle = "rgba(255,255,255,0.16)"; circle(c, x, y, rng);
+        c.strokeStyle = "rgba(255,255,255,0.35)"; c.lineWidth = 2;
+        c.beginPath(); c.arc(x, y, rng, 0, 7); c.stroke();
+      }
+    }
+    c.fillStyle = "#cce0ec";
+    ellipse(c, x, y + bh / 2, bw / 2 + 3, 5);
+    c.fillStyle = bodyCol;
+    ellipse(c, x, y + bob, bw / 2, bh / 2);
+    c.fillStyle = d.belly;
+    ellipse(c, x, y + 4 + bob, bw * 0.31, bh * 0.33);
+    if (isRainbow) {
+      // rainbow-striped belly
+      c.save();
+      c.beginPath();
+      c.ellipse(x, y + 4 + bob, bw * 0.31, bh * 0.33, 0, 0, 7);
+      c.clip();
+      const bandH = (bh * 0.66) / RAINBOW.length;
+      RAINBOW.forEach((col, i) => {
+        c.fillStyle = col;
+        c.fillRect(x - bw * 0.31, y + 4 + bob - bh * 0.33 + i * bandH, bw * 0.62, bandH + 0.5);
+      });
+      c.restore();
+    }
+    const hy = y - bh / 2 + 2 + bob, hr = 10 + this.level;
+    c.fillStyle = bodyCol; circle(c, x, hy, hr);
+    c.fillStyle = WHITE; circle(c, x - 4, hy - 2, 3); circle(c, x + 4, hy - 2, 3);
+    c.fillStyle = BLACK; circle(c, x - 4, hy - 2, 1.2); circle(c, x + 4, hy - 2, 1.2);
+    c.fillStyle = d.beak;
+    c.beginPath(); c.moveTo(x - 4, hy + 2); c.lineTo(x + 4, hy + 2); c.lineTo(x, hy + 8); c.fill();
+    c.fillStyle = bodyCol;
+    ellipse(c, x - bw / 2 - 2, y + 2 + bob, 4, 8);
+    ellipse(c, x + bw / 2 + 2, y + 2 + bob, 4, 8);
+    c.fillStyle = GOLD;
+    for (let i = 0; i <= this.level; i++) circle(c, x - 8 + i * 8, y + bh / 2 + 8, 3);
+    // oil splotches stack up with each hit
+    const splots = [[-7, -3], [6, 5], [-3, 9], [4, -8]];
+    c.fillStyle = "rgba(28,24,30,0.85)";
+    for (let i = 0; i < this.hits; i++) {
+      circle(c, x + splots[i][0], y + bob + splots[i][1], 4.5);
+    }
+    if (this.disabled) {
+      // slicked over and out of action
+      c.fillStyle = "rgba(28,24,30,0.45)";
+      circle(c, x, y - 4 + bob, Math.max(bw, bh) * 0.62);
+      c.fillStyle = RED; c.font = "bold 16px Trebuchet MS"; c.textAlign = "center";
+      c.fillText("!", x, y - bh / 2 - 12 + Math.sin(this.anim * 3) * 2);
+      c.textAlign = "left";
+    }
+    // dazzled: little rainbow stars circle the head
+    if (game.stunTimer > 0 && this.data.projectile) {
+      for (let i = 0; i < 3; i++) {
+        const a = game.stunTimer / 12 + i * 2.09;
+        c.fillStyle = RAINBOW[(i * 2) % RAINBOW.length];
+        circle(c, x + Math.cos(a) * 13, hy - hr - 5 + Math.sin(a) * 4, 2.2);
+      }
+    }
+  }
+}
+
+// ============================================================================
+// Canvas primitives
+// ============================================================================
+const cv = document.getElementById("game");
+const ctx = cv.getContext("2d");
+function circle(c, x, y, r) { c.beginPath(); c.arc(x, y, r, 0, 7); c.fill(); }
+function ellipse(c, x, y, rx, ry) { c.beginPath(); c.ellipse(x, y, rx, ry, 0, 0, 7); c.fill(); }
+function rrect(c, x, y, w, h, r) {
+  c.beginPath(); c.roundRect(x, y, w, h, r); c.fill();
+}
+
+// ============================================================================
+// Background (pre-rendered once)
+// ============================================================================
+function renderBackground() {
+  const bg = document.createElement("canvas");
+  bg.width = W; bg.height = H;
+  const c = bg.getContext("2d");
+  c.fillStyle = ICE; c.fillRect(0, 0, W, H);
+  // texture, seeded fresh per map
+  let seed = 1 + Math.floor(Math.random() * 2147483000);
+  const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  c.strokeStyle = "#cce0ec"; c.lineWidth = 1;
+  for (let i = 0; i < 220; i++) {
+    c.beginPath();
+    c.arc(rnd() * FIELD_W, rnd() * H, 6 + rnd() * 20, 0, 7);
+    c.stroke();
+  }
+  // water strips
+  c.fillStyle = WATER;
+  c.fillRect(0, 0, FIELD_W, 26); c.fillRect(0, H - 26, FIELD_W, 26);
+  c.strokeStyle = WATER_DARK; c.lineWidth = 2;
+  for (let i = 0; i < FIELD_W; i += 34) {
+    c.beginPath(); c.arc(i + 17, 13, 15, Math.PI, 0, false); c.stroke();
+    c.beginPath(); c.arc(i + 17, H - 13, 15, Math.PI, 0, false); c.stroke();
+  }
+  // path
+  c.lineCap = "round"; c.lineJoin = "round";
+  c.strokeStyle = PATH_EDGE; c.lineWidth = 44;
+  drawPath(c);
+  c.strokeStyle = PATH_COLOR; c.lineWidth = 36;
+  drawPath(c);
+  // oil stains near this map's spawn point
+  const entryY = PATH[0][1];
+  c.fillStyle = "#3c373e";
+  for (let i = 0; i < 14; i++) circle(c, rnd() * 110 - 20, entryY - 40 + rnd() * 90, 3 + rnd() * 6);
+  // chick colony beside this map's exit
+  const exitX = PATH[PATH.length - 1][0];
+  const ex = exitX >= FIELD_W / 2 ? exitX - 66 : exitX + 66, ey = H - 46;
+  c.fillStyle = "#b4a082"; ellipse(c, ex, ey, 46, 15);
+  for (const ox of [-24, 0, 24]) {
+    const cx = ex + ox, cy = ey - 12;
+    c.fillStyle = "#787d87"; circle(c, cx, cy, 10);
+    c.fillStyle = "#ebebe6"; circle(c, cx, cy + 3, 6);
+    c.fillStyle = BLACK; circle(c, cx - 3, cy - 3, 1.2); circle(c, cx + 3, cy - 3, 1.2);
+    c.fillStyle = "#f5aa3c";
+    c.beginPath(); c.moveTo(cx - 2, cy); c.lineTo(cx + 2, cy); c.lineTo(cx, cy + 4); c.fill();
+  }
+  return bg;
+}
+function drawPath(c) {
+  c.beginPath();
+  c.moveTo(...PATH[0]);
+  for (let i = 1; i < PATH.length; i++) c.lineTo(...PATH[i]);
+  c.stroke();
+}
+
+// ============================================================================
+// Game
+// ============================================================================
+const game = {
+  bg: null,
+  mouse: [0, 0],
+  bestWave: 0,
+  newMap() {
+    PATH = generatePath();
+    computeDensePath();
+    this.bg = renderBackground();
+  },
+  reset() {
+    this.newMap();
+    this.fish = STARTING_FISH; this.lives = STARTING_LIVES; this.wave = 0;
+    this.enemies = []; this.towers = []; this.projectiles = [];
+    this.fx = []; this.floaters = [];
+    this.spawnQueue = []; this.spawnTimer = 0;
+    this.betweenWaves = true; this.waveBreak = FPS * 4;
+    this.selectedType = null; this.selectedTower = null;
+    this.paused = false; this.gameOver = false; this.victory = false;
+    this.stunTimer = 0; this.glitter = null;
+    this.orca = null; this.orcaStruck = true; this.orcaTimer = 0;
+  },
+  nextWave(w) {
+    if (w === 10) return 10.5;
+    if (w === 10.5) return 11;
+    if (w === 20) return 20.5;
+    if (w === 20.5) return 21;
+    return w + 1;
+  },
+  startWave() {
+    this.wave = this.nextWave(this.wave);
+    this.spawnQueue = waveComposition(this.wave);
+    this.spawnTimer = 30;
+    this.betweenWaves = false;
+    this.orcaStruck = false;
+    this.orcaTimer = 180 + Math.floor(Math.random() * 420);   // strikes 3–10s into the wave
+    if (this.wave % 1 !== 0) {
+      const name = this.wave === 10.5 ? "THE OIL SLUG" : "THE OIL TURTLE";
+      this.floaters.push(new FloatText([FIELD_W / 2, 160], `⚠ BOSS WAVE — ${name} APPROACHES! ⚠`, RED));
+    }
+  },
+  useBomb() {
+    if (this.paused || this.gameOver || this.victory) return;
+    if (!this.enemies.length) {
+      this.floaters.push(new FloatText([FIELD_W / 2, 100], "No oil on the ice!", RED));
+      return;
+    }
+    if (this.fish < BOMB_COST) {
+      this.floaters.push(new FloatText([FIELD_W / 2, 100], `Glitter bomb costs ${BOMB_COST} fish!`, RED));
+      return;
+    }
+    this.fish -= BOMB_COST;
+    this.stunTimer = FPS * 4;          // penguins too dazzled to fire for 4s
+    this.glitter = new GlitterShower();
+    this.enemies.forEach(e => e.hit(140));
+    this.floaters.push(new FloatText([FIELD_W / 2, 130], "✨ RAINBOW GLITTER BOMB! ✨", GOLD));
+  },
+  updateSpawning() {
+    if (this.spawnQueue.length) {
+      if (--this.spawnTimer <= 0) {
+        const [kind, delay] = this.spawnQueue.shift();
+        this.enemies.push(new Enemy(kind, this.wave));
+        this.spawnTimer = delay;
+      }
+    } else if (!this.enemies.length && !this.betweenWaves) {
+      const bonus = 40 + this.wave * 6;
+      this.fish += bonus;
+      this.floaters.push(new FloatText([FIELD_W / 2, 80], `Wave cleared! +${bonus} fish`, GOLD));
+      this.bestWave = Math.max(this.bestWave, this.wave);
+      if (this.wave > TOTAL_WAVES) this.victory = true;
+      else { this.betweenWaves = true; this.waveBreak = FPS * 6; }
+    }
+  },
+  rainbowCount() {
+    return this.towers.filter(t => t.kind === "rainbow").length;
+  },
+  validSpot(pos) {
+    const [x, y] = pos;
+    if (!(x > 24 && x < FIELD_W - 24 && y > 48 && y < H - 48)) return false;
+    if (pointNearPath(pos)) return false;
+    return !this.towers.some(t => dist(pos, t.pos) < 42);
+  },
+  tryUpgrade() {
+    const t = this.selectedTower;
+    if (!t) return;
+    if (t.hits > 0) return this.repairSelected();   // wash the oil off before upgrading
+    if (t.canUpgrade()) {
+      const cost = t.upgradeCost();
+      if (this.fish >= cost) {
+        this.fish -= cost; t.spent += cost; t.level++;
+        this.floaters.push(new FloatText(t.pos, "Upgraded!", GREEN));
+      } else this.floaters.push(new FloatText(t.pos, "Not enough fish!", RED));
+    }
+  },
+  repairSelected() {
+    const t = this.selectedTower;
+    if (!t || t.hits === 0) return;
+    if (this.fish >= REPAIR_COST) {
+      this.fish -= REPAIR_COST;
+      t.hits = 0;
+      this.floaters.push(new FloatText(t.pos, "Squeaky clean!", GREEN));
+    } else {
+      this.floaters.push(new FloatText(t.pos, "Not enough fish!", RED));
+    }
+  },
+  sellSelected() {
+    const t = this.selectedTower;
+    if (t) {
+      this.fish += t.sellValue();
+      this.floaters.push(new FloatText(t.pos, `+${t.sellValue()} fish`, GOLD));
+      this.towers.splice(this.towers.indexOf(t), 1);
+      this.selectedTower = null;
+    }
+  },
+  update() {
+    if (this.paused || this.gameOver || this.victory) return;
+    if (this.stunTimer > 0) this.stunTimer--;
+    if (this.glitter) {
+      this.glitter.update();
+      if (this.glitter.dead) this.glitter = null;
+    }
+    if (this.betweenWaves) { if (--this.waveBreak <= 0) this.startWave(); }
+    else this.updateSpawning();
+    // orca hunts overcrowded colonies: once per wave, only while 6+ penguins are deployed
+    if (!this.betweenWaves && !this.orcaStruck && !this.orca && this.towers.length > 5) {
+      if (--this.orcaTimer <= 0) {
+        const victim = this.towers[Math.floor(Math.random() * this.towers.length)];
+        this.orca = new Orca(victim, this);
+        this.orcaStruck = true;
+      }
+    }
+    if (this.orca) {
+      this.orca.update();
+      if (this.orca.dead) this.orca = null;
+    }
+    this.towers.forEach(t => t.update(this));
+    this.projectiles.forEach(p => p.update());
+    this.projectiles = this.projectiles.filter(p => !p.dead);
+    this.fx.forEach(f => f.update());
+    this.fx = this.fx.filter(f => !f.dead);
+    for (const e of this.enemies) {
+      e.update(this);
+      if (e.reachedEnd) this.lives -= e.damage;
+      else if (e.dead) this.fish += e.reward;
+    }
+    this.enemies = this.enemies.filter(e => !e.dead && !e.reachedEnd);
+    if (this.lives <= 0) {
+      this.lives = 0; this.gameOver = true;
+      this.bestWave = Math.max(this.bestWave, this.wave);
+    }
+    this.floaters.forEach(f => f.update());
+    this.floaters = this.floaters.filter(f => f.life > 0);
+  },
+};
+game.reset();
+
+// ============================================================================
+// UI geometry
+// ============================================================================
+const towerBtnRect = i => [FIELD_W + 12, 110 + i * 76, PANEL_W - 24, 70];
+const bombBtnRect = () => [FIELD_W + 12, 614, PANEL_W - 24, 56];
+const upgradeBtnRect = () => [FIELD_W + 12, 520, PANEL_W - 24, 34];
+const sellBtnRect = () => [FIELD_W + 12, 562, PANEL_W - 24, 34];
+const inRect = (p, r) => p[0] >= r[0] && p[0] <= r[0] + r[2] && p[1] >= r[1] && p[1] <= r[1] + r[3];
+
+// ============================================================================
+// Drawing
+// ============================================================================
+function drawPanel(c) {
+  c.fillStyle = PANEL_BG; c.fillRect(FIELD_W, 0, PANEL_W, H);
+  c.fillStyle = GOLD; c.font = "bold 26px Trebuchet MS";
+  c.fillText(`Fish: ${game.fish}`, FIELD_W + 14, 36);
+  c.font = "15px Trebuchet MS";
+  c.fillStyle = game.lives > 6 ? GREEN : RED;
+  c.fillText(`Colony health: ${game.lives}`, FIELD_W + 14, 62);
+  c.fillStyle = WHITE;
+  let waveTxt = `Wave ${game.wave}/${TOTAL_WAVES}`;
+  if (game.wave % 1 !== 0) { waveTxt = `BOSS WAVE ${game.wave}!`; c.fillStyle = GOLD; }
+  if (game.betweenWaves && !game.victory) waveTxt += `  (next: ${Math.ceil(game.waveBreak / FPS)}s)`;
+  c.fillText(waveTxt, FIELD_W + 14, 84);
+
+  TOWER_ORDER.forEach((kind, i) => {
+    const d = TOWER_TYPES[kind];
+    const r = towerBtnRect(i);
+    const sel = game.selectedType === kind;
+    const rainbowMaxed = kind === "rainbow" && game.rainbowCount() >= MAX_RAINBOWS;
+    const afford = game.fish >= d.cost && !rainbowMaxed;
+    c.fillStyle = sel ? "#46648c" : PANEL_LIGHT;
+    rrect(c, ...r, 8);
+    if (sel) { c.strokeStyle = BLUE_LT; c.lineWidth = 2; c.beginPath(); c.roundRect(...r, 8); c.stroke(); }
+    // mini penguin
+    const icx = r[0] + 24, icy = r[1] + 38;
+    c.fillStyle = kind === "rainbow" ? `hsl(${(performance.now() / 16) % 360}, 55%, 45%)` : d.color;
+    ellipse(c, icx, icy, 11, 16);
+    c.fillStyle = d.belly; ellipse(c, icx, icy + 4, 7, 10);
+    if (kind === "rainbow") {
+      c.save();
+      c.beginPath(); c.ellipse(icx, icy + 4, 7, 10, 0, 0, 7); c.clip();
+      RAINBOW.forEach((col, j) => {
+        c.fillStyle = col;
+        c.fillRect(icx - 7, icy - 6 + j * (20 / RAINBOW.length), 14, 20 / RAINBOW.length + 0.5);
+      });
+      c.restore();
+    }
+    c.fillStyle = kind === "rainbow" ? `hsl(${(performance.now() / 16) % 360}, 55%, 45%)` : d.color;
+    circle(c, icx, icy - 18, 8);
+    c.fillStyle = d.beak;
+    c.beginPath(); c.moveTo(icx - 3, icy - 16); c.lineTo(icx + 3, icy - 16); c.lineTo(icx, icy - 11); c.fill();
+    c.fillStyle = afford ? WHITE : "#969696";
+    c.font = "bold 14px Trebuchet MS";
+    c.fillText(`${i + 1}. ${d.name}`, r[0] + 48, r[1] + 17);
+    c.fillStyle = afford ? GOLD : "#96825a";
+    c.font = "13px Trebuchet MS";
+    const costTxt = kind === "rainbow"
+      ? (rainbowMaxed ? `${game.rainbowCount()}/${MAX_RAINBOWS} deployed — MAX` : `${d.cost} fish  (${game.rainbowCount()}/${MAX_RAINBOWS})`)
+      : `${d.cost} fish`;
+    c.fillText(costTxt, r[0] + 48, r[1] + 32);
+    // wrapped description
+    c.fillStyle = "#b9c8d4";
+    c.font = "11px Trebuchet MS";
+    wrapText(c, d.desc, r[0] + 48, r[1] + 46, r[2] - 56, 12, 2);
+  });
+
+  const infoY = 494;
+  if (game.selectedTower) {
+    const t = game.selectedTower;
+    const [dmg, rng] = t.stats;
+    const label = t.kind === "fisher" ? "income/tick" : "damage";
+    c.fillStyle = WHITE; c.font = "bold 15px Trebuchet MS";
+    c.fillText(`${t.data.name}  (Lv ${t.level + 1})`, FIELD_W + 14, infoY);
+    c.fillStyle = "#b9c8d4"; c.font = "13px Trebuchet MS";
+    let statLine = `${label}: ${dmg}   range: ${rng}`;
+    if (t.hits > 0) statLine += `   oil: ${t.hits}/${OIL_HITS_TO_DISABLE}`;
+    c.fillText(statLine, FIELD_W + 14, infoY + 20);
+    const ur = upgradeBtnRect();
+    if (t.hits > 0) {
+      c.fillStyle = t.disabled ? "#a05a3c" : "#7a6a3c"; rrect(c, ...ur, 6);
+      c.fillStyle = WHITE; c.font = "14px Trebuchet MS";
+      c.fillText(`${t.disabled ? "REPAIR" : "Clean"} (U) — ${REPAIR_COST}`, ur[0] + 10, ur[1] + 22);
+    } else if (t.canUpgrade()) {
+      c.fillStyle = "#3c7850"; rrect(c, ...ur, 6);
+      c.fillStyle = WHITE; c.font = "14px Trebuchet MS";
+      c.fillText(`Upgrade (U) — ${t.upgradeCost()}`, ur[0] + 10, ur[1] + 22);
+    } else {
+      c.fillStyle = "#46505a"; rrect(c, ...ur, 6);
+      c.fillStyle = "#aab4be"; c.font = "14px Trebuchet MS";
+      c.fillText("Max level", ur[0] + 10, ur[1] + 22);
+    }
+    const sr = sellBtnRect();
+    c.fillStyle = "#8c5046"; rrect(c, ...sr, 6);
+    c.fillStyle = WHITE;
+    c.fillText(`Sell (S) — +${t.sellValue()}`, sr[0] + 10, sr[1] + 22);
+  } else {
+    c.fillStyle = "#a0b2c0"; c.font = "12px Trebuchet MS";
+    ["Tap a penguin, then the ice,", "to place it. Tap placed penguins", "to upgrade or sell.", "⚠ 6+ penguins attract orcas!",
+     "SPACE: send wave early", "P: pause   ESC: deselect",
+     game.bestWave ? `Best run: wave ${game.bestWave}` : ""]
+      .forEach((ln, j) => c.fillText(ln, FIELD_W + 14, infoY + j * 17));
+  }
+
+  // glitter bomb button
+  const br = bombBtnRect();
+  if (game.fish >= BOMB_COST) {
+    c.save();
+    c.beginPath(); c.roundRect(...br, 8); c.clip();
+    const stripeH = br[3] / RAINBOW.length;
+    RAINBOW.forEach((col, j) => {
+      c.fillStyle = col;
+      c.fillRect(br[0], br[1] + j * stripeH, br[2], stripeH + 0.5);
+    });
+    c.fillStyle = "rgba(20,25,35,0.45)";
+    c.fillRect(...br);
+    c.restore();
+    c.strokeStyle = WHITE; c.lineWidth = 2;
+    c.beginPath(); c.roundRect(...br, 8); c.stroke();
+    // twinkle
+    const tw = performance.now() / 90;
+    c.fillStyle = WHITE;
+    for (let i = 0; i < 4; i++) {
+      circle(c, br[0] + 12 + ((i * 53 + tw * 20) % (br[2] - 24)),
+             br[1] + 8 + ((i * 31 + tw * 9) % (br[3] - 16)), 1.5);
+    }
+    c.fillStyle = WHITE; c.font = "bold 15px Trebuchet MS";
+    c.fillText(`✨ GLITTER BOMB (B) — ${BOMB_COST}`, br[0] + 14, br[1] + 24);
+    c.font = "11px Trebuchet MS"; c.fillStyle = "#f0f0f5";
+    c.fillText("Nukes all oil — dazzles penguins 4s", br[0] + 14, br[1] + 42);
+  } else {
+    c.fillStyle = "#3a4450"; rrect(c, ...br, 8);
+    c.fillStyle = "#9aa6b2"; c.font = "bold 15px Trebuchet MS";
+    c.fillText(`✨ GLITTER BOMB — ${BOMB_COST}`, br[0] + 14, br[1] + 24);
+    c.font = "11px Trebuchet MS";
+    c.fillText(`Need ${BOMB_COST - game.fish} more fish`, br[0] + 14, br[1] + 42);
+  }
+}
+
+function wrapText(c, text, x, y, maxW, lh, maxLines) {
+  const words = text.split(" ");
+  let line = "", lines = 0;
+  for (const w of words) {
+    if (c.measureText(line + w).width > maxW && line) {
+      c.fillText(line, x, y + lines * lh);
+      line = w + " ";
+      if (++lines >= maxLines) return;
+    } else line += w + " ";
+  }
+  c.fillText(line, x, y + lines * lh);
+}
+
+function drawGhost(c) {
+  if (!game.selectedType) return;
+  const pos = game.mouse;
+  if (pos[0] >= FIELD_W || pos[1] < 0) return;
+  const d = TOWER_TYPES[game.selectedType];
+  const ok = game.validSpot(pos) && game.fish >= d.cost;
+  const rng = d.levels[0][1];
+  if (rng > 0) {
+    c.fillStyle = ok ? "rgba(120,220,140,0.24)" : "rgba(230,90,80,0.24)";
+    circle(c, pos[0], pos[1], rng);
+  }
+  c.strokeStyle = "#fff"; c.lineWidth = 2;
+  c.beginPath(); c.arc(pos[0], pos[1], 20, 0, 7); c.stroke();
+}
+
+function overlay(c, title, sub) {
+  c.fillStyle = "rgba(10,20,30,0.67)"; c.fillRect(0, 0, W, H);
+  c.textAlign = "center";
+  c.fillStyle = WHITE; c.font = "bold 48px Trebuchet MS";
+  c.fillText(title, W / 2, H / 2 - 30);
+  c.fillStyle = "#c8d7e4"; c.font = "24px Trebuchet MS";
+  c.fillText(sub, W / 2, H / 2 + 20);
+  c.textAlign = "left";
+}
+
+function draw() {
+  ctx.drawImage(game.bg, 0, 0);
+  [...game.towers].sort((a, b) => a.pos[1] - b.pos[1])
+    .forEach(t => t.draw(ctx, t === game.selectedTower));
+  game.enemies.forEach(e => e.draw(ctx));
+  game.projectiles.forEach(p => p.draw(ctx));
+  game.fx.forEach(f => f.draw(ctx));
+  game.floaters.forEach(f => f.draw(ctx));
+  if (game.orca) game.orca.draw(ctx);
+  drawGhost(ctx);
+  // big boss health bar
+  const boss = game.enemies.find(e => BOSS_NAMES[e.kind]);
+  if (boss) {
+    const bw = 380, bx = (FIELD_W - bw) / 2, by = 44;
+    ctx.fillStyle = "rgba(20,24,28,0.75)";
+    rrect(ctx, bx - 10, by - 26, bw + 20, 46, 8);
+    ctx.fillStyle = boss.shelled ? BLUE_LT : WHITE;
+    ctx.font = "bold 14px Trebuchet MS"; ctx.textAlign = "center";
+    ctx.fillText(BOSS_NAMES[boss.kind] + (boss.shelled ? "  🛡 SHELLED" : ""), FIELD_W / 2, by - 8);
+    ctx.textAlign = "left";
+    ctx.fillStyle = "#3c3c3c"; ctx.fillRect(bx, by, bw, 10);
+    ctx.fillStyle = boss.shelled ? BLUE_LT : RED;
+    ctx.fillRect(bx, by, bw * Math.max(0, boss.hp / boss.maxHp), 10);
+  }
+  drawPanel(ctx);
+  if (game.glitter) game.glitter.draw(ctx);   // sparkles shower the whole screen
+  if (game.betweenWaves && game.wave === 0) {
+    ctx.fillStyle = "#28404f"; ctx.font = "bold 28px Trebuchet MS"; ctx.textAlign = "center";
+    ctx.fillText("Oil is coming!  Build your defenses!", FIELD_W / 2, 320);
+    ctx.textAlign = "left";
+  }
+  if (game.paused) overlay(ctx, "PAUSED", "Press P to resume");
+  else if (game.gameOver) overlay(ctx, "THE COLONY IS SLICKED!", `You survived ${game.wave} waves — tap or press R to retry`);
+  else if (game.victory) overlay(ctx, "COLONY SAVED!", "The oil has been stopped — tap or press R to play again");
+}
+
+// ============================================================================
+// Input
+// ============================================================================
+function canvasPos(ev) {
+  const r = cv.getBoundingClientRect();
+  const cx = (ev.touches ? ev.touches[0].clientX : ev.clientX) - r.left;
+  const cy = (ev.touches ? ev.touches[0].clientY : ev.clientY) - r.top;
+  return [cx * W / r.width, cy * H / r.height];
+}
+
+function handleClick(pos) {
+  if (game.gameOver || game.victory) { game.reset(); return; }
+  const [x] = pos;
+  if (x >= FIELD_W) {
+    if (inRect(pos, bombBtnRect())) return game.useBomb();
+    for (let i = 0; i < TOWER_ORDER.length; i++) {
+      if (inRect(pos, towerBtnRect(i))) {
+        const kind = TOWER_ORDER[i];
+        game.selectedType = game.selectedType === kind ? null : kind;
+        game.selectedTower = null;
+        return;
+      }
+    }
+    if (game.selectedTower) {
+      if (inRect(pos, upgradeBtnRect())) return game.tryUpgrade();
+      if (inRect(pos, sellBtnRect())) return game.sellSelected();
+    }
+    return;
+  }
+  for (const t of game.towers) {
+    if (dist(pos, t.pos) < 24) {
+      game.selectedTower = t; game.selectedType = null;
+      return;
+    }
+  }
+  if (game.selectedType) {
+    if (game.selectedType === "rainbow" && game.rainbowCount() >= MAX_RAINBOWS) {
+      game.floaters.push(new FloatText(pos, `Only ${MAX_RAINBOWS} Rainbow Penguins exist!`, RED));
+      return;
+    }
+    const cost = TOWER_TYPES[game.selectedType].cost;
+    if (game.fish >= cost && game.validSpot(pos)) {
+      game.towers.push(new Tower(game.selectedType, pos));
+      game.fish -= cost;
+    } else if (game.fish < cost) {
+      game.floaters.push(new FloatText(pos, "Not enough fish!", RED));
+    } else {
+      game.floaters.push(new FloatText(pos, "Can't build here", RED));
+    }
+  } else {
+    game.selectedTower = null;
+  }
+}
+
+cv.addEventListener("mousedown", ev => handleClick(canvasPos(ev)));
+cv.addEventListener("mousemove", ev => { game.mouse = canvasPos(ev); });
+cv.addEventListener("touchstart", ev => {
+  ev.preventDefault();
+  const p = canvasPos(ev);
+  game.mouse = p;
+  handleClick(p);
+}, { passive: false });
+
+window.addEventListener("keydown", ev => {
+  switch (ev.key) {
+    case "Escape": game.selectedType = null; game.selectedTower = null; break;
+    case "p": case "P": game.paused = !game.paused; break;
+    case " ":
+      if (game.betweenWaves && !game.victory) game.waveBreak = 0;
+      ev.preventDefault(); break;
+    case "r": case "R":
+      if (game.gameOver || game.victory) game.reset();
+      else if (game.selectedTower) game.repairSelected();
+      break;
+    case "u": case "U": game.tryUpgrade(); break;
+    case "b": case "B": game.useBomb(); break;
+    case "s": case "S": if (game.selectedTower) game.sellSelected(); break;
+    case "1": case "2": case "3": case "4": case "5": {
+      const kind = TOWER_ORDER[+ev.key - 1];
+      game.selectedType = game.selectedType === kind ? null : kind;
+      game.selectedTower = null;
+      break;
+    }
+  }
+});
+
+// ============================================================================
+// Fixed-timestep loop (matches pygame's 60 FPS logic)
+// ============================================================================
+let last = performance.now(), acc = 0;
+const STEP = 1000 / FPS;
+function loop(now) {
+  acc = Math.min(acc + (now - last), 250);
+  last = now;
+  while (acc >= STEP) { game.update(); acc -= STEP; }
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
